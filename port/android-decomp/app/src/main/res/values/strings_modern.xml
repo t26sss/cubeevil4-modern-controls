@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="ingame_modern_controls">Modern controls</string>
+    <string name="ingame_modern_controls_help">Modern controls: the left stick moves Leon in the direction you push it, as the camera sees it, instead of the original tank controls. The right stick turns the camera. Aiming faces where the camera looks.</string>
+</resources>
