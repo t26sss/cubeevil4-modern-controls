@@ -1,0 +1,117 @@
+name: Build modded APK
+
+# This repo holds ONLY the mod (patches + scripts). The workflow downloads the upstream project fresh, applies the mod
+# and builds. Nothing here needs to be synced with upstream: pick the upstream branch/tag when you run it.
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_repo:
+        description: "Upstream repository"
+        required: true
+        default: "Andiweli/CubeEvil4-Android"
+      upstream_ref:
+        description: "Upstream branch or tag (master, or a tag like 0.99.12-rc)"
+        required: true
+        default: "master"
+  schedule:
+    - cron: "0 3 * * 1"   # every Monday: an early warning when upstream changed something the mod depends on
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.upstream_repo || 'Andiweli/CubeEvil4-Android' }}
+          ref: ${{ inputs.upstream_ref || 'master' }}
+          path: upstream
+
+      - uses: actions/checkout@v4
+        with:
+          path: mod
+
+      - name: Apply the mod to the upstream tree
+        working-directory: upstream
+        run: |
+          cp -r ../mod/port ./
+          cp ../mod/scripts/*.py ./
+          for f in apply_modern_controls apply_touchlook apply_aimwalk apply_bonedump; do
+            python3 "$f.py"
+          done
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('upstream/port/android-decomp/**/*.gradle', 'upstream/port/android-decomp/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: Install build tools and NDK r28c
+        working-directory: upstream
+        run: sudo port/tools/whole_setup_linux.sh --android
+
+      - name: Build game core (.so)
+        working-directory: upstream
+        run: port/tools/whole_build_android.sh --ndk /opt/android-ndk-r28c --abi arm64-v8a
+
+      # Signing: with the secrets KEYSTORE_B64 (the keystore file, base64), STORE_PASS, KEY_ALIAS and KEY_PASS the APK always has
+      # the same signature (updates install over each other). Without them a throw-away key is made: every build has a new
+      # signature and the old app has to be uninstalled first.
+      - name: Signing key
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+          STORE_PASS: ${{ secrets.STORE_PASS }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.KEY_PASS }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/mod.keystore"
+            echo "MOD_STORE_PASS=$STORE_PASS" >> "$GITHUB_ENV"
+            echo "MOD_KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
+            echo "MOD_KEY_PASS=$KEY_PASS" >> "$GITHUB_ENV"
+          else
+            keytool -genkeypair -keystore "$RUNNER_TEMP/mod.keystore" -storepass android -keypass android \
+              -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Mod Build,O=Mod,C=US"
+            echo "MOD_STORE_PASS=android" >> "$GITHUB_ENV"
+            echo "MOD_KEY_ALIAS=androiddebugkey" >> "$GITHUB_ENV"
+            echo "MOD_KEY_PASS=android" >> "$GITHUB_ENV"
+          fi
+          echo "MOD_KEYSTORE=$RUNNER_TEMP/mod.keystore" >> "$GITHUB_ENV"
+          cat > "$RUNNER_TEMP/mod-key.gradle" <<'GRADLE'
+          allprojects {
+            pluginManager.withPlugin('com.android.application') {
+              android.signingConfigs.debug {
+                storeFile new File(System.getenv('MOD_KEYSTORE'))
+                storePassword System.getenv('MOD_STORE_PASS')
+                keyAlias System.getenv('MOD_KEY_ALIAS')
+                keyPassword System.getenv('MOD_KEY_PASS')
+              }
+            }
+          }
+          GRADLE
+
+      - name: Build APK
+        working-directory: upstream/port/android-decomp
+        run: |
+          chmod +x gradlew
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          ./gradlew assembleCoreDebug -I "$RUNNER_TEMP/mod-key.gradle" -Pre4.versionCode=$((200 + GITHUB_RUN_NUMBER))
+
+      - name: Show APK signature
+        continue-on-error: true
+        run: |
+          APKSIGNER=$(ls -d "$ANDROID_HOME"/build-tools/*/apksigner | tail -1)
+          "$APKSIGNER" verify --print-certs upstream/port/android-decomp/app/build/outputs/apk/core/debug/*.apk | grep -E "certificate (DN|SHA-256)" || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CubeEvil4-modern-controls-apk
+          path: upstream/port/android-decomp/app/build/outputs/apk/core/debug/*.apk
+          
