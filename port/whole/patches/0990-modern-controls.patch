@@ -1,0 +1,428 @@
+# The app menu's "Modern controls" (wish of a user, 12.11.2026, Controls page): the left stick moves Leon in the
+# direction it points, as the camera sees it, instead of the original's tank controls. Off (the default): as the game.
+# player.cpp re4ModernPrepare runs before the movement routine (pl_R0_Move; only the free-moving routines: idle,
+# walk, back step, run, turn): Leon turns toward the stick (at most 0.25 rad a frame) and the routine is told "up"
+# (Key bit 1) only, with the back / left / right bits off (restored afterwards), so walk and run start and stop as
+# always. The digital pad does the same. The shoulder camera follows Leon's yaw, so a camera-relative stick would
+# circle: while Leon walks and stands the camera keeps a yaw of its own (g_re4_modern_cam_yaw, turned by the right
+# stick; cam_qfps.cpp calcBaseMatrix builds its base matrix from it), otherwise the yaw follows Leon's. With the
+# aim key held Leon first turns to where the camera looks, then the game's aim routine runs unchanged.
+# Walking while aiming: in the weapon routine with the aim key held the app sends the move stick as the C stick
+# (Key.substick; the aim stick is the main stick), and re4ModernAimWalk moves Leon's position over the ground
+# (re4_modern_aim_walk mm a frame at the full stick, the way MotionAddSpeed adds the root motion), the aim pose
+# of the game unchanged: he glides, there is no walking animation for the legs.
+# Not covered: ladders, crouching, boats, pushing and the knife keep the original keys; the back step and the
+# B+down quick turn are off while the switch is on (the stick turns him around instead).
+# Bone list: the first time the switch is on, leon_bones.txt in the app's files folder (re4ModernDumpBones).
+# Legs while aiming: re4ModernLegs runs Leon's walk motion on a work of its own after the weapon routine and lets only
+# the leg parts (17 hip joint, 18-21 left leg, 22-25 right leg, from leon_bones.txt) take its pose; the others are
+# skipped for that call (parts flag bit 29), so the aim pose stays. The walk's speed follows the glide's speed.
+# The aim bends the pelvis (part 0) with the aim pitch: the hip joint (17) gets the walk's pose turned back by the
+# difference of the walk's and the aim pose's pelvis rotations, so the legs keep their direction (not stretched).
+# The legs only: the game blends the aim up / down motion into the parts' matrices after its partsMatCalc (matBlend), the angles
+# the parts keep are the raw motion's: re4ModernLegs builds the matrices of the leg parts 17..25 itself and leaves the rest as the game has them.
+# The legs' IK: the walk motion has the foot target of its leg chains in the effector parts' position (model space) and the knee
+# comes from the game's two-bone IK (ik.cpp): re4ModernLegs runs IKInit with the walk motion, the world matrices of the leg parts,
+# InverseKinematics and the parts under the legs, then the aim motion's IK set-up and the parts' flags back.
+# The bob: while Leon walks aiming the body (the world matrices of all parts and of the weapon) goes up and down by a small step
+# (re4_modern_bob mm top to bottom) and sways to the side of the foot on the floor (re4_modern_sway) with the beat of the feet of the last frame; the leg IK keeps the feet on their targets.
+# The bob goes into the hips' local matrix too (the game builds the world matrices again from the local ones after this) and the arms
+# (the shoulders 5 and 11 with everything under them and the weapon) follow the body with a delay (re4_modern_arm_gain).
+# The bob and the arms' delay are applied by re4ModernBodyShift in the LOCAL matrices of the hips (0) and the shoulders (5, 11),
+# once a frame: first thing in cPlayer::setLaserSight (pl_class.cpp: the laser is drawn from the weapon there, so it moves with the
+# gun), else in re4ModernLegs before the world matrices are built again.
+# Two switches, each works without the other: "Modern controls" (re4_modern_controls: the stick moves Leon as the camera sees it, the
+# right stick turns the camera) and "Walk while aiming" (re4_modern_aimwalk: the walk with the aim key held, the legs, the bob).
+# re4_modern_arm_gain 0: the arms move exactly with the body.
+--- a/src/game/cam_qfps.cpp
++++ b/src/game/cam_qfps.cpp
+@@ -24,6 +24,8 @@
+ /* port (patch 0205): the app's "Field of view" (wish of the project owner, 05.11.2026), degrees added to the
+    game's own field of view of this camera, kept between 10 and 120 degrees; 0 as the game. */
+ extern "C" f32 re4_fov_offset(void); /* port: runtime/aim_options.cpp */
++extern int g_re4_modern_cam_active; /* port (patch 0228): player.cpp */
++extern f32 g_re4_modern_cam_yaw;
+ static f32 re4FovOf(f32 fovy)
+ {
+     f32 add = re4_fov_offset();
+@@ -414,6 +416,18 @@
+     if (m_state & 1) {
+         PSMTXCopy(m_pl_mat, mat);
+     }
++    if (g_re4_modern_cam_active && pPL && pPL->r_no_0 == 0) {
++        /* port (patch 0228): "Modern controls", the camera keeps a yaw of its own */
++        Vec mv0;
++        Vec mv2;
++        getColumn(mat, 3, &mv0);
++        mv2.x = 0.0f;
++        mv2.y = g_re4_modern_cam_yaw;
++        mv2.z = 0.0f;
++        PSMTXIdentity(mat);
++        RotMatrix(mat, &mv2);
++        TransMatrix(mat, &mv0);
++    }
+     if (m_pl_ofs.x != 0.0f || m_pl_ofs.y != 0.0f || m_pl_ofs.z != 0.0f) {
+         PSMTXMultVec(mat, &m_pl_ofs, &v0);
+         TransMatrix(mat, &v0);
+--- a/src/game/player.cpp
++++ b/src/game/player.cpp
+@@ -392,6 +392,616 @@
+     debugMove();
+ }
+ 
++// Port (patch 0228), the app menu's "Modern controls" (wish of a user, 12.11.2026): the left stick moves Leon
++// in the direction it points, as the camera sees it, instead of the original's tank controls (left / right turn
++// him, up walks, down backs away). Off (the default): as the game.
++//  - The shoulder camera follows Leon's yaw, so the stick could not be relative to it (a push to the right would
++//    turn Leon, the camera would follow and the push would turn him further: a circle). While Leon walks and
++//    stands, the camera keeps a yaw of its own (re4_modern_cam_yaw, turned by the right stick; the camera takes
++//    it in CameraQuasiFPS::calcBaseMatrix); at every other time it is set to Leon's yaw, so aiming, events
++//    and the end of them start from where the game puts the camera.
++//  - Each frame, before the routine runs: Leon turns toward the stick's direction (re4_modern_turn at most per
++//    frame) and the game is told "up" only (Key bit 1), so walk and run start and stop as they always did; the
++//    turn, back-step and quick-turn keys (bits 2, 4, 8) are off for the routine and restored afterwards.
++//  - Aiming (the aim key held): Leon first turns to where the camera looks, then the game's own aim routine runs.
++int g_re4_modern_cam_active = 0;
++f32 g_re4_modern_cam_yaw = 0.0f;
++
++static const f32 re4_modern_turn = 0.25f;      // rad a frame
++static const f32 re4_modern_cam_speed = 0.14f;  // rad a frame at the full right stick
++
++extern "C" int re4_modern_controls(void); /* port: runtime/aim_options.cpp (patch 0228) */
++
++// The stick (x right, y up) as a direction on the ground as the camera sees it, not scaled.
++// The camera's forward on the ground and its right (Leon turning right adds to ang.y: forward (sin, cos), right (-cos, sin): right-handed, +x is on the left when facing +z).
++static void re4ModernWorldDir(f32 x, f32 y, f32* pDx, f32* pDz)
++{
++    f32 fx = -pG->Camera.Look.x;
++    f32 fz = -pG->Camera.Look.z;
++    const f32 len = sqrtf(fx * fx + fz * fz);
++    if (len < 0.1f) {
++        fx = sinf(g_re4_modern_cam_yaw);
++        fz = cosf(g_re4_modern_cam_yaw);
++    } else {
++        fx /= len;
++        fz /= len;
++    }
++    *pDx = fx * y - fz * x;
++    *pDz = fz * y + fx * x;
++}
++
++// Walking while aiming (the weapon routine, the aim key held): the app sends the move stick in the C stick
++// (Key.substick) and the aim stick as the main stick. Leon keeps the game's aim pose and glides over the ground
++// the way the stick points; his position is moved as the motion's root does (MotionAddSpeed).
++extern f32 g_re4_modern_leg_mag;
++static const f32 re4_modern_aim_walk = 48.0f;  // units (1 unit = 1 mm) a frame at the full stick: about 1.4 m/s at 30 frames
++
++static void re4ModernAimWalk(cPlayer* pEm)
++{
++    const f32 x = (f32) Key.substickX;
++    const f32 y = (f32) Key.substickY;
++    Key.substickX = 0;  // the camera takes the C stick as a look offset otherwise
++    Key.substickY = 0;
++    const f32 len = sqrtf(x * x + y * y);
++    if (len <= 30.0f) {
++        return;
++    }
++    f32 dx;
++    f32 dz;
++    re4ModernWorldDir(x, y, &dx, &dz);
++    const f32 dl = sqrtf(dx * dx + dz * dz);
++    if (dl < 0.0001f) {
++        return;
++    }
++    f32 mag = len / 59.0f;
++    if (mag > 1.0f) {
++        mag = 1.0f;
++    }
++    pEm->pos.x += dx / dl * re4_modern_aim_walk * mag;
++    pEm->pos.z += dz / dl * re4_modern_aim_walk * mag;
++    g_re4_modern_leg_mag = mag;
++}
++
++// Port (patch 0990), for finding Leon's leg parts: once, the first time the switch is on and Leon exists, a list of
++// his parts is written to leon_bones.txt in the app's files folder (runtime/aim_options.cpp): the parts' index, the
++// index of its parent (255: the model), the joint centre of the model data (the rest pose, mm) and the world position
++// now (relative to Leon's position).
++extern "C" void re4_modern_bone_begin(int n);
++extern "C" void re4_modern_bone(int index, int parent, f32 cx, f32 cy, f32 cz, f32 wx, f32 wy, f32 wz);
++extern "C" void re4_modern_bone_end(void);
++
++static void re4ModernDumpBones(cPlayer* pEm)
++{
++    ModelDataHead* rec = pEm->pModelInfo->model_addr->pHead;
++    cParts* p = pEm->pList;
++    u32 i;
++
++    re4_modern_bone_begin((int) pEm->nParts);
++    re4_modern_bone(-1, 0, re4_modern_aim_walk, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);  // build check: the aim walk speed
++    for (i = 0; i < pEm->nParts && p != NULL; i++) {
++        re4_modern_bone((int) i, (int) rec->parentNo, rec->center.x, rec->center.y, rec->center.z,
++                        p->world.x - pEm->pos.x, p->world.y - pEm->pos.y, p->world.z - pEm->pos.z);
++        rec++;
++        p = p->pList;
++    }
++    re4_modern_bone_end();
++}
++
++// Port (patch 0990), the legs of walking while aiming: Leon's walk motion runs on a work of its own and only his
++// leg parts (17 the hip joint, 18-21 the left leg, 22-25 the right leg: leon_bones.txt) take its pose; every other
++// part keeps the aim pose of the game. The walk's frames advance with the speed of the glide
++// (re4_modern_aim_walk), so the feet keep up with the ground. g_re4_modern_leg_mag is the stick's size (0 to 1)
++// of this frame's glide, 0 when Leon does not glide.
++// The aim pose bends the pelvis (part 0) up or down with the aim (the model's three-way blend), and the legs hang
++// from it: the hip joint (17) gets the walk's pose in the walk's own pelvis frame, turned back by the difference
++// of the two pelvis rotations, so the legs keep the direction they have in the walk.
++f32 g_re4_modern_leg_mag = 0.0f;
++
++static MOTION_INFO g_leg_mot;
++static void* g_leg_data = NULL;
++static void* g_leg_owner = NULL;
++static f32 g_leg_step = 40.0f;      // mm a frame of the walk motion at speed 1
++static u16 g_leg_hist[10][6][3];    // the key history of the walk motion on the parts 17..25 and 0 (slot 9)
++static u8 g_leg_skip[200];
++
++static const u32 RE4_LEG_FIRST = 17;
++static const u32 RE4_LEG_LAST = 25;
++
++static int re4LegSlot(u32 i)
++{
++    if (i == 0) {
++        return 9;
++    }
++    if (i >= RE4_LEG_FIRST && i <= RE4_LEG_LAST) {
++        return (int) (i - RE4_LEG_FIRST);
++    }
++    return -1;
++}
++
++static void re4LegHistSwap(cParts* p, int slot)
++{
++    int j;
++
++    for (j = 0; j < 6; j++) {
++        const u16 a0 = p->motParts.hist[j][0];
++        const u16 a1 = p->motParts.hist[j][1];
++        const u16 a2 = p->motParts.hist[j][2];
++
++        p->motParts.hist[j][0] = g_leg_hist[slot][j][0];
++        p->motParts.hist[j][1] = g_leg_hist[slot][j][1];
++        p->motParts.hist[j][2] = g_leg_hist[slot][j][2];
++        g_leg_hist[slot][j][0] = a0;
++        g_leg_hist[slot][j][1] = a1;
++        g_leg_hist[slot][j][2] = a2;
++    }
++}
++
++// The angles (the order of RotMatrix: z, then y, then x) of a rotation matrix.
++static void re4LegEuler(Mtx m, Vec* out)
++{
++    f32 sy = -m[2][0];
++
++    if (sy > 1.0f) {
++        sy = 1.0f;
++    } else if (sy < -1.0f) {
++        sy = -1.0f;
++    }
++    out->y = asinf(sy);
++    if (fabsf(m[2][0]) < 0.9999f) {
++        out->x = atan2f(m[2][1], m[2][2]);
++        out->z = atan2f(m[1][0], m[0][0]);
++    } else {
++        out->x = atan2f(-m[1][2], m[1][1]);
++        out->z = 0.0f;
++    }
++}
++
++extern "C" void re4_modern_trace(const float* v, int n); /* port: runtime/aim_options.cpp, aim_walk_trace.txt */
++
++// partsWorldCalc for one part (uniform scale): the matrix and the position in the world from the parent's matrix.
++static void re4LegWorld(cParts* p)
++{
++    cCoord* parent = p->pParent;
++    Vec tmp;
++
++    tmp.x = p->l_mat[0][3];
++    tmp.y = p->l_mat[1][3];
++    tmp.z = p->l_mat[2][3];
++    PSMTXMultVec(parent->mat, &tmp, &p->world);
++    PSMTXConcat(parent->mat, p->l_mat, p->mat);
++    TransMatrix(p->mat, &p->world);
++    p->r_scale.x = parent->r_scale.x * p->scale.x;
++    p->r_scale.y = parent->r_scale.y * p->scale.y;
++    p->r_scale.z = parent->r_scale.z * p->scale.z;
++}
++
++// The walk's bob: the hips and the whole body above them go up and down with the steps while Leon walks aiming
++// (the aim pose is still, so he would slide). The beat comes from the feet of the last frame: the hips are lowest when the
++// two ankles are about level (both feet on the floor) and highest when one is raised most; the IK then bends the knees
++// since the feet keep their targets.
++static const f32 re4_modern_bob = 90.0f;      // mm, top to bottom
++static const f32 re4_modern_sway = 30.0f;     // mm, to the side of the foot on the floor (each way)
++static const f32 re4_modern_bob_foot = 150.0f; // mm of height between the ankles that counts as the highest point
++static f32 g_leg_foot_diff = 0.0f;
++static f32 g_leg_foot_signed = 0.0f;  // ankle 20 minus ankle 24 (leg 24 is on the +x side of the model)
++static f32 g_leg_bob = 0.0f;
++static f32 g_leg_sway = 0.0f;
++
++// Adds a world offset to the local translation of a part (the offset turned into the parent's frame: the game builds the
++// world matrices again from the local ones after this, an offset only on the world matrices would be gone).
++static void re4LegAddLocal(cParts* p, f32 ox, f32 oy, f32 oz)
++{
++    MtxPtr m = p->pParent->mat;
++
++    p->l_mat[0][3] += m[0][0] * ox + m[1][0] * oy + m[2][0] * oz;
++    p->l_mat[1][3] += m[0][1] * ox + m[1][1] * oy + m[2][1] * oz;
++    p->l_mat[2][3] += m[0][2] * ox + m[1][2] * oy + m[2][2] * oz;
++}
++
++// The arms go after the body with some delay (secondary motion): the shoulders (the parts 5 and 11, the arm chains under
++// them with the hands and the weapon) get the difference between the delayed bob and the body's.
++static const f32 re4_modern_arm_gain = 0.0f;  // 0: the arms move exactly with the body (a delayed part made them move out of step)
++static f32 g_arm_y = 0.0f;
++static f32 g_arm_x = 0.0f;
++
++// The bob and the arms' delay, once a frame, in the LOCAL matrices of the hips (part 0) and of the shoulders (parts 5 and
++// 11): the game builds the world matrices from them again, and the laser sight (cPlayer::setLaserSight, which calls this
++// first) is drawn from the weapon in them. g_re4_body_shifted: done for this frame.
++int g_re4_body_shifted = 0;
++
++void re4ModernBodyShift(cPlayer* pEm)
++{
++    f32 d;
++    f32 sd;
++    f32 dy;
++    f32 ox;
++    f32 oz;
++    f32 ay;
++    f32 ax;
++    f32 aox;
++    f32 aoz;
++    f32 mag = g_re4_modern_leg_mag;
++    cParts* p0;
++    cParts* p5;
++    cParts* p11;
++
++    if (g_re4_body_shifted || mag <= 0.0f || pEm->nParts < 12) {
++        return;
++    }
++    p0 = pEm->getPartsPtr(0);
++    p5 = pEm->getPartsPtr(5);
++    p11 = pEm->getPartsPtr(11);
++    if (p0 == NULL || p5 == NULL || p11 == NULL) {
++        return;
++    }
++    d = g_leg_foot_diff / re4_modern_bob_foot;
++    if (d > 1.0f) {
++        d = 1.0f;
++    }
++    sd = g_leg_foot_signed / re4_modern_bob_foot;
++    if (sd > 1.0f) {
++        sd = 1.0f;
++    } else if (sd < -1.0f) {
++        sd = -1.0f;
++    }
++    dy = re4_modern_bob * (d - 0.5f) * mag;
++    g_leg_bob += (dy - g_leg_bob) * 0.5f;
++    g_leg_sway += (re4_modern_sway * sd * mag - g_leg_sway) * 0.4f;
++    ox = pEm->mat[0][0] * g_leg_sway;
++    oz = pEm->mat[2][0] * g_leg_sway;
++    // the arms follow the body and a delayed part of it is added: some inertia
++    g_arm_y += (g_leg_bob - g_arm_y) * 0.25f;
++    g_arm_x += (g_leg_sway - g_arm_x) * 0.25f;
++    ay = (g_arm_y - g_leg_bob) * re4_modern_arm_gain;
++    ax = (g_arm_x - g_leg_sway) * re4_modern_arm_gain;
++    aox = pEm->mat[0][0] * ax;
++    aoz = pEm->mat[2][0] * ax;
++    re4LegAddLocal(p0, ox, g_leg_bob, oz);
++    re4LegAddLocal(p5, aox, ay, aoz);
++    re4LegAddLocal(p11, aox, ay, aoz);
++    g_re4_body_shifted = 1;
++}
++
++extern "C" void re4_modern_trace2(const float* v, int n); /* port: runtime/aim_options.cpp, aim_walk_trace2.txt */
++
++static void re4ModernLegs(cPlayer* pEm, f32 mag)
++{
++    f32 tr2[66];
++    Vec trWalk0;
++    Vec trLeg17;
++    void** tbl = pEm->m_MotTbl;
++    const int ok = dmMotCk();
++    MotionData* data = (MotionData*) (ok ? tbl[2] : tbl[0x61]);
++    void* seq = ok ? tbl[3] : tbl[0x62];
++    cParts* p;
++    cParts* p0;
++    cParts* p17;
++    Vec ang0;
++    Vec pos0;
++    Vec scale0;
++    u32 i;
++    int k;
++    int j;
++    int slot;
++
++    if (data == NULL || pEm->nParts > 200) {
++        return;
++    }
++    p0 = pEm->getPartsPtr(0);
++    p17 = pEm->getPartsPtr(RE4_LEG_FIRST);
++    if (p0 == NULL || p17 == NULL) {
++        return;
++    }
++    if (g_leg_data != (void*) data || g_leg_owner != (void*) pEm) {
++        u8* b = (u8*) &g_leg_mot;
++        u32 n;
++
++        for (n = 0; n < sizeof(MOTION_INFO); n++) {
++            b[n] = 0;
++        }
++        g_leg_mot.Mot_flag = 0x30000000;  // 0x10000000: no IK set-up, 0x20000000: leave the model's blend motion alone
++        MotionSetCore(pEm, &g_leg_mot, data, seq, 0, 5, 0);
++        for (k = 0; k < 10; k++) {
++            for (j = 0; j < 6; j++) {
++                g_leg_hist[k][j][0] = 0;
++                g_leg_hist[k][j][1] = 0;
++                g_leg_hist[k][j][2] = 0;
++            }
++        }
++        {
++            const f32 frames = (f32) (g_leg_mot.Seq_frame_num > 0 ? g_leg_mot.Seq_frame_num : 1);
++            const f32 dist = sqrtf(g_leg_mot.Pos_dist.x * g_leg_mot.Pos_dist.x + g_leg_mot.Pos_dist.z * g_leg_mot.Pos_dist.z);
++
++            g_leg_step = dist / frames;
++            if (g_leg_step < 5.0f) {
++                g_leg_step = 40.0f;
++            }
++        }
++        g_leg_mot.Seq_speed = 1.0f;
++        g_leg_data = (void*) data;
++        g_leg_owner = (void*) pEm;
++    }
++    g_leg_mot.Seq_speed = (re4_modern_aim_walk * mag) / g_leg_step;
++
++    ang0 = p0->ang;
++    pos0 = p0->pos;
++    scale0 = p0->scale;
++    // the walk motion only touches the pelvis and the leg parts: the others are skipped (parts flag bit 29) for this
++    // call, and those parts get the history of the walk motion
++    for (p = pEm->pList, i = 0; p != NULL; p = p->pList, i++) {
++        slot = re4LegSlot(i);
++        if (slot >= 0) {
++            g_leg_skip[i] = 0;
++            re4LegHistSwap(p, slot);
++        } else if (!(p->motParts.flags & 0x20000000)) {
++            p->motParts.flags |= 0x20000000;
++            g_leg_skip[i] = 1;
++        } else {
++            g_leg_skip[i] = 0;
++        }
++    }
++    {
++        // trace 2: the angles of the parts 17..25 and of two others (5, 2) before the walk motion touches them
++        cParts* q;
++
++        for (q = pEm->pList, i = 0; q != NULL; q = q->pList, i++) {
++            if (i >= 17 && i <= 25) {
++                tr2[(i - 17) * 6 + 0] = q->ang.x;
++                tr2[(i - 17) * 6 + 1] = q->
