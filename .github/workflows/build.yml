@@ -31,11 +31,22 @@ jobs:
         with:
           path: mod
 
+      # The mod comes as modern-controls-v2.zip at the root of this repo (a zip is uploaded byte for byte: a patch file pasted
+      # or edited on a phone can lose its trailing spaces/lines and then fails with "unexpected end of file in patch").
+      # Without the zip, the loose files (port/ and scripts/) are used.
       - name: Apply the mod to the upstream tree
         working-directory: upstream
         run: |
-          cp -r ../mod/port ./
-          cp ../mod/scripts/*.py ./
+          if [ -f ../mod/modern-controls-v2.zip ]; then
+            unzip -o ../mod/modern-controls-v2.zip
+          else
+            cp -r ../mod/port ./
+            cp ../mod/scripts/*.py ./
+          fi
+          echo "--- the patch as it is now:"
+          wc -c -l port/whole/patches/0990-modern-controls.patch
+          sha256sum port/whole/patches/0990-modern-controls.patch
+          tail -n 2 port/whole/patches/0990-modern-controls.patch
           for f in apply_modern_controls apply_touchlook apply_aimwalk apply_bonedump; do
             python3 "$f.py"
           done
@@ -114,4 +125,3 @@ jobs:
         with:
           name: CubeEvil4-modern-controls-apk
           path: upstream/port/android-decomp/app/build/outputs/apk/core/debug/*.apk
-          
